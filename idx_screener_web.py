@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import json
 import os
+import time
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -101,11 +102,23 @@ def calc_atr(high, low, close, period=14):
 # DATA FETCH
 # ==========================================================
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_batch(tickers_tuple, period="6mo"):
+def fetch_batch(tickers_tuple, period="6mo", max_retries=3):
+    """Batch download dengan retry + exponential backoff buat handle rate-limit Yahoo Finance."""
     yf_tickers = " ".join(f"{t}.JK" for t in tickers_tuple)
-    data = yf.download(yf_tickers, period=period, progress=False, auto_adjust=True,
-                        group_by="ticker", threads=True)
-    return data
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            data = yf.download(yf_tickers, period=period, progress=False, auto_adjust=True,
+                                group_by="ticker", threads=False)
+            if data is not None and not data.empty:
+                return data
+            last_error = "Data kosong dari Yahoo Finance"
+        except Exception as e:
+            last_error = str(e)
+        # exponential backoff: 3s, 6s, 12s sebelum retry
+        if attempt < max_retries - 1:
+            time.sleep(3 * (2 ** attempt))
+    raise RuntimeError(f"Gagal ambil data setelah {max_retries}x percobaan: {last_error}")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -289,10 +302,16 @@ with st.sidebar:
             watchlist = [t for t in watchlist if sectors_map.get(t) in sector_filter]
 
     if len(watchlist) > 100:
-        st.warning(f"⚠️ {len(watchlist)} saham akan discreening — bisa makan waktu beberapa menit.")
-        batch_size = st.slider("Ukuran batch per request", 20, 100, 50, 10)
+        st.warning(
+            f"⚠️ {len(watchlist)} saham akan discreening. Yahoo Finance kadang rate-limit "
+            "request dari server cloud — kalau gagal, coba lagi beberapa menit kemudian atau "
+            "kecilin batch size & perbesar delay."
+        )
+        batch_size = st.slider("Ukuran batch per request", 10, 100, 20, 5)
+        batch_delay = st.slider("Delay antar-batch (detik)", 1, 15, 5, 1)
     else:
-        batch_size = 50
+        batch_size = 30
+        batch_delay = 2
 
     period = st.selectbox("Periode data", ["3mo", "6mo", "1y"], index=1)
     vol_spike_mult = st.slider("Volume spike minimal (x rata-rata)", 1.0, 3.0, 1.5, 0.1)
@@ -319,6 +338,7 @@ if run_button:
         st.stop()
 
     results = []
+    failed_batches = []
     batches = [watchlist[i:i + batch_size] for i in range(0, len(watchlist), batch_size)]
     progress = st.progress(0, text="Memulai screening...")
 
@@ -327,17 +347,34 @@ if run_button:
                            text=f"Batch {bi + 1}/{len(batches)} — {len(batch)} saham...")
         try:
             batch_data = fetch_batch(tuple(batch), params["period"])
-        except Exception:
+        except Exception as e:
+            failed_batches.append((bi + 1, str(e)))
+            time.sleep(batch_delay)
             continue
         for t in batch:
             r = analyze_ticker(t, batch_data, params)
             if r:
                 r["Sector"] = sectors_map.get(t, "-")
                 results.append(r)
+        if bi < len(batches) - 1:
+            time.sleep(batch_delay)
     progress.empty()
 
+    if failed_batches:
+        with st.expander(f"⚠️ {len(failed_batches)} batch gagal diambil (klik buat detail)"):
+            for bnum, err in failed_batches[:10]:
+                st.caption(f"Batch {bnum}: {err}")
+            st.info(
+                "Ini biasanya karena Yahoo Finance rate-limit server cloud. "
+                "Coba kurangin batch size, perbesar delay, atau jalankan lagi beberapa menit kemudian."
+            )
+
     if not results:
-        st.error("Gak ada hasil. Cek watchlist atau koneksi internet.")
+        st.error(
+            "Gak ada hasil sama sekali — kemungkinan besar Yahoo Finance lagi rate-limit server ini. "
+            "Coba: (1) tunggu 5-10 menit lalu jalankan ulang, (2) kecilin batch size ke 10, "
+            "(3) perbesar delay antar-batch, atau (4) pake versi local di laptop yang lebih reliable."
+        )
     else:
         df_results = pd.DataFrame(results).sort_values("Score", ascending=False).reset_index(drop=True)
 
